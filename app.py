@@ -1,165 +1,176 @@
-"""우리 집 휴식 취향 실험실
-실행: streamlit run app.py
-배포: GitHub에 두 파일 업로드 → Streamlit Community Cloud → app.py 선택.
-API 키 불필요. 브라우저 세션별 독립 기록. JSON 백업으로 보관/이동 가능.
+"""가는 김에 · 실행: streamlit run app.py
+GitHub에 이 파일과 requirements.txt 업로드 → Streamlit Community Cloud에서 app.py 배포.
+아래 앱 안의 '처음 연결하기'에 데이터베이스 설치 SQL과 Secrets 안내가 있습니다.
+각 가족이 같은 전용 가족 계정으로 로그인하는 소규모 가족용 버전입니다.
+API 키·비밀번호를 GitHub에 올리지 마세요. 외부 데이터베이스 Supabase 필요.
 """
 import datetime as dt
 import html
-import json
-import random
 import time
 import uuid
 import streamlit as st
+from supabase import create_client
 
-ACTIVITIES = [
-    ('창밖 한 장면', '창밖에서 눈에 들어오는 색 세 가지를 천천히 찾아보세요.', '조용히', '앉아서'),
-    ('한 곡만 듣기', '좋아하는 노래 한 곡을 골라 다른 일을 하지 않고 들어보세요. 음악 재생은 평소 쓰는 앱을 이용하세요.', '음악', '앉아서'),
-    ('사진 한 장', '사진첩에서 다시 보고 싶은 사진 한 장을 골라 그 순간을 떠올려 보세요.', '추억', '앉아서'),
-    ('멍 때리는 자리', '편한 자세로 앉아 잠깐 아무것도 하지 않아도 괜찮은 시간을 가져보세요.', '조용히', '앉아서'),
-    ('종이 위 낙서', '종이에 떠오르는 선이나 모양을 자유롭게 그려보세요. 완성할 필요는 없어요.', '만들기', '앉아서'),
-    ('색깔 수집', '자리에서 보이는 물건 중 오늘 마음에 드는 색을 찾아보세요.', '만들기', '앉아서'),
-    ('짧은 바깥 구경', '원하고 움직임이 편한 경우에만, 안전하고 익숙한 곳을 잠깐 둘러보세요. 불편하면 앉아서 창밖 보기로 바꿔도 돼요.', '바깥', '걷기'),
-    ('한 사람과 쉬는 대화', '대화하고 싶은 가족이 괜찮다면, 오늘 있었던 사소한 일 하나만 나눠보세요.', '대화', '앉아서'),
-]
-RATINGS = ('다시 하고 싶다', '보통이다', '나와 안 맞는다')
-
-
-def validate(data):
-    if not isinstance(data, dict) or data.get('version') != 1:
-        raise ValueError('백업 버전을 확인해 주세요.')
-    rows = data.get('records')
-    if not isinstance(rows, list) or len(rows) > 3000:
-        raise ValueError('기록은 최대 3,000개입니다.')
-    clean = []
-    seen = set()
-    for r in rows:
-        if not isinstance(r, dict):
-            raise ValueError('기록 형식 오류')
-        for k, limit in [('id',80),('name',20),('activity',60),('date',40),('note',300)]:
-            if not isinstance(r.get(k), str) or len(r[k]) > limit:
-                raise ValueError('기록 내용을 확인해 주세요.')
-        if not r['id'] or r['id'] in seen or not r['name'].strip():
-            raise ValueError('이름 또는 중복 기록 오류')
-        if r.get('rating') not in RATINGS or type(r.get('minutes')) is not int or not 1 <= r['minutes'] <= 30:
-            raise ValueError('시간 또는 평가 오류')
-        dt.datetime.fromisoformat(r['date'])
-        seen.add(r['id'])
-        clean.append({k:r[k] for k in ('id','name','activity','date','note','rating','minutes')})
-    return clean
+SQL = '''-- Supabase 프로젝트 SQL Editor에서 실행하세요.
+create table if not exists public.family_errands (
+ id uuid primary key default gen_random_uuid(),
+ owner uuid not null default auth.uid() references auth.users(id),
+ title text not null check (char_length(title) between 1 and 80),
+ route text not null check (route in ('시내에서','집으로','기숙사로')),
+ requester text not null check (char_length(requester) between 1 and 30),
+ note text not null default '' check (char_length(note)<=500),
+ due date,
+ status text not null default '대기' check (status in ('대기','진행','완료')),
+ assignee text not null default '' check (char_length(assignee)<=30),
+ claim_token uuid,
+ created_at timestamptz not null default now(),
+ updated_at timestamptz not null default now()
+);
+alter table public.family_errands enable row level security;
+drop policy if exists family_private on public.family_errands;
+create policy family_private on public.family_errands for all to authenticated
+ using (owner=auth.uid()) with check (owner=auth.uid());
+grant select, insert, update, delete on public.family_errands to authenticated;
+'''
+ROUTES=['시내에서','집으로','기숙사로']
 
 
-def summary(rows):
-    result = {}
-    for r in rows:
-        item = result.setdefault(r['activity'], [0,0,0])
-        item[RATINGS.index(r['rating'])] += 1
-    return sorted(result.items(), key=lambda x: (-(x[1][0]/sum(x[1])), -sum(x[1]), x[0]))
+def esc(s): return html.escape(str(s))
+
+
+def config():
+    try:return st.secrets.get('SUPABASE_URL',''),st.secrets.get('SUPABASE_ANON_KEY','')
+    except Exception:return '', ''
+
+
+def setup():
+    with st.expander('처음 연결하기 · 배포 안내'):
+        st.markdown('''**한 번만 설정하면 가족이 각자 휴대폰에서 같은 목록을 봅니다.**
+
+1. Supabase에서 프로젝트를 만들고 SQL Editor에서 아래 SQL을 실행하세요.
+2. Authentication → Users에서 **전용 가족 계정**을 만들고 이메일 확인을 완료하세요. 관리 화면에서 Add user로 이메일 확인된 사용자를 생성해도 됩니다.
+3. Streamlit Community Cloud에서 GitHub 저장소와 `app.py`를 선택하세요.
+4. Streamlit 앱 설정 → Secrets에 아래 두 값을 저장하세요. Supabase의 공개 publishable 키 또는 legacy anon 키를 사용하고, **secret/service_role 키는 사용하지 마세요.**
+5. 가족끼리만 전용 계정 이메일과 비밀번호를 안전하게 공유하세요. 각자는 로그인 후 다른 별명을 입력합니다.
+
+이 버전은 가족별 **공동 계정 하나**를 쓰므로 개별 사용자 권한 구분은 없습니다. 별명은 신원 인증이 아니며, 로그인한 가족은 전체 목록을 관리할 수 있어요. 다른 가족은 별도 계정을 써야 목록이 분리됩니다.''')
+        st.code('SUPABASE_URL = "https://프로젝트.supabase.co"\nSUPABASE_ANON_KEY = "공개 키"',language='toml')
+        st.code(SQL,language='sql')
+        st.caption('Supabase 저장 정책과 서비스 이용 조건이 적용됩니다. 주소·암호·결제 정보 등 민감한 내용은 부탁에 적지 마세요. 자동 알림/백그라운드 동기화는 없으며 새로고침 버튼으로 최신 상태를 확인합니다.')
 
 
 def main():
-    st.set_page_config(page_title='우리 집 휴식 취향 실험실', page_icon='🌿', layout='centered')
+    st.set_page_config(page_title='가는 김에',page_icon='🛍️',layout='centered',initial_sidebar_state='collapsed')
     st.markdown('''<style>
-.stApp{background:#f4f6f1;color:#283f35}.block-container{max-width:850px;padding-top:2rem}
-h1,h2,h3{color:#284b3c}.hero{background:#234c3c;color:#fffbed;padding:30px;border-radius:22px;margin-bottom:18px}.hero h1{color:#fffbed;font-size:2rem}.hero p{color:#dfebd8;line-height:1.8}.card{background:#fffdf5;border:1px solid #d9e2d4;border-radius:18px;padding:24px;margin:18px 0}.card h3{margin-top:0}.tag{font-size:12px;letter-spacing:2px}.stButton>button[kind="primary"]{background:#356348;border:0}
-</style>''', unsafe_allow_html=True)
+[data-testid="stSidebar"],[data-testid="stSidebarCollapsedControl"]{display:none}
+.stApp{background:#f6f7fb;color:#192a39}.block-container{max-width:680px;padding:1.5rem 1rem 4rem}
+h1,h2,h3{color:#132b39}button{min-height:46px!important;border-radius:14px!important}.stButton>button[kind="primary"]{background:#176b51;border:none;color:white}.hero{background:#123e33;border-radius:25px;padding:26px 24px;color:white;margin-bottom:18px}.hero h1{color:white;font-size:2.15rem;margin:5px 0}.hero p{color:#d5eadf;margin-bottom:0}.pill{font-size:12px;letter-spacing:2px;color:#c5ed8f}.tile{border-left:5px solid #72b48a;background:white;border-radius:15px;padding:18px;margin-top:12px;border:1px solid #e0e6e7}.tile h3{font-size:20px;margin:5px 0 10px}.meta{font-size:13px;color:#566772}.splash{height:70vh;display:flex;align-items:center;justify-content:center;text-align:center}.splashbox{width:100%;background:#123e33;border-radius:35px;padding:65px 15px;color:white}.splashbox h1{color:white}.mark{font-size:70px}
+</style>''',unsafe_allow_html=True)
     ss=st.session_state
-    if 'records' not in ss: ss.records=[]
-    if 'experiment' not in ss: ss.experiment=None
-    st.markdown('''<div class="hero"><div class="tag">A SMALL BREAK · A PERSONAL DISCOVERY</div><h1>🌿 우리 집 휴식 취향 실험실</h1><p>남들이 좋다는 휴식 말고,<br>나에게 다시 하고 싶은 휴식을 찾아봐요.</p></div>''', unsafe_allow_html=True)
-    st.caption('경쟁도 연속 출석도 없어요. 마음에 안 맞는 휴식을 알아낸 것도 소중한 발견이에요.')
-    with st.sidebar:
-        st.header('기록 보관함')
-        st.info('이 앱은 접속 세션별로 독립적이에요. 다른 휴대폰과 자동 공유되지 않으며, 새로고침·세션 종료 시 기록이 사라질 수 있어요.')
-        payload=json.dumps({'version':1,'records':ss.records},ensure_ascii=False,indent=2)
-        st.download_button('JSON 백업 저장',payload,'휴식취향백업.json','application/json',use_container_width=True)
-        upload=st.file_uploader('백업 불러오기',type=['json'])
-        confirm=st.checkbox('불러오면 현재 기록을 대체합니다.')
-        if st.button('백업 적용',disabled=not upload or not confirm):
-            try:
-                if upload.size>2000000: raise ValueError('파일은 2MB 이하여야 해요.')
-                rows=validate(json.loads(upload.getvalue().decode('utf-8-sig')))
-                ss.records=rows
-                st.rerun()
-            except (ValueError,TypeError,KeyError,UnicodeError):
-                st.error('백업 형식이 올바르지 않아요. 기존 기록은 유지했어요.')
-        st.caption('자신의 기록은 본인 동의 없이 가족에게 공개하지 마세요. 상세 건강정보는 적지 않아도 돼요.')
-    explore, discover, history=st.tabs(['🧪 오늘의 실험','🌱 나의 휴식 취향','📔 실험 노트'])
-    with explore:
-        st.subheader('오늘은 어떻게 쉬고 싶나요?')
-        if ss.experiment is None:
-            name=st.text_input('내 이름 또는 별명',max_chars=20,placeholder='예: 엄마, 아빠, 나')
-            mins=st.select_slider('오늘 내어 볼 시간',options=[1,3,5,10,15,20,30],value=3)
-            style=st.selectbox('지금 끌리는 활동', ['아무거나','조용히','음악','추억','만들기','바깥','대화'])
-            seated=st.checkbox('앉아서 할 수 있는 활동만',value=True)
-            candidates=[a for a in ACTIVITIES if (style=='아무거나' or a[2]==style) and (not seated or a[3]=='앉아서')]
-            if not candidates:
-                st.info('이 조건에 맞는 활동이 없어요. 활동 종류를 바꾸거나, 원하는 활동을 직접 적어 주세요.')
-            custom=st.text_input('또는 내가 하고 싶은 휴식',max_chars=60,placeholder='선택 사항 · 예: 좋아하는 책 두 쪽 읽기')
-            if st.button('오늘의 휴식 만나기',type='primary',use_container_width=True):
-                if not name.strip(): st.warning('기록을 구분할 별명을 적어 주세요.')
-                elif not candidates and not custom.strip(): st.warning('활동 조건을 바꾸거나 직접 적어 주세요.')
-                else:
-                    a=(custom.strip(),'내가 정한 방식으로 부담 없이 쉬어보세요. 불편하거나 원하지 않으면 언제든 중단해도 괜찮아요.','직접 선택','자유') if custom.strip() else random.choice(candidates)
-                    ss.experiment={'name':name.strip(),'minutes':mins,'activity':a[0],'guide':a[1],'start':None}
-                    st.rerun()
-        else:
-            e=ss.experiment
-            st.markdown(f'<div class="card"><span class="tag">{e["minutes"]}분의 작은 실험</span><h3>{html.escape(e["activity"])}</h3><p>{html.escape(e["guide"])}</p></div>',unsafe_allow_html=True)
-            st.caption('시간은 목표일 뿐이에요. 끝까지 채울 필요도, 잘 해낼 필요도 없어요.')
-            if e['start'] is None:
-                if st.button('잠깐 쉬고 올게요',type='primary',use_container_width=True):
-                    e['start']=time.time();st.rerun()
+    if not ss.get('intro'):
+        ss.intro=True
+        view=st.empty();view.markdown('<div class="splash"><div class="splashbox"><div class="mark">🛍️↗</div><h1>가는 김에</h1><p>부탁은 모으고, 헛걸음은 줄이고.</p></div></div>',unsafe_allow_html=True)
+        time.sleep(3);view.empty()
+    st.markdown('<div class="hero"><div class="pill">ONE TRIP, TOGETHER</div><h1>가는 김에 🛍️</h1><p>누가 챙기는지 알면, 두 번 살 일 없으니까.</p></div>',unsafe_allow_html=True)
+    url,key=config()
+    if not url or not key:
+        st.info('가족의 부탁을 안전하게 저장하려면 최초 연결이 필요해요. API 키 없이 동작하는 임시 목록으로 가장하지 않습니다.')
+        setup();return
+    if 'db' not in ss:
+        try:ss.db=create_client(url,key)
+        except Exception:
+            st.error('연결 설정을 확인해 주세요.');setup();return
+    db=ss.db
+    if not ss.get('logged_in'):
+        st.subheader('우리 가족 공간에 들어가기')
+        st.caption('가족이 같은 전용 계정으로 로그인하고, 각자의 별명으로 부탁을 맡아요.')
+        with st.form('login'):
+            email=st.text_input('가족 계정 이메일',max_chars=254)
+            password=st.text_input('비밀번호',type='password')
+            nick=st.text_input('내 별명',max_chars=30,placeholder='예: 아빠, 엄마, 나')
+            enter=st.form_submit_button('함께 챙기러 가기',type='primary',use_container_width=True)
+        if enter:
+            if not email.strip() or not password or not nick.strip():st.warning('이메일, 비밀번호, 별명을 적어 주세요.')
             else:
-                elapsed=max(0,int((time.time()-e['start'])//60))
-                st.info(f'시작 후 약 {elapsed}분 · 시간은 화면을 새로 확인할 때 갱신돼요. 앱을 켜 둔 시간이지 실제 휴식 측정값은 아니에요.')
-                if st.button('시간 다시 확인'):st.rerun()
-            with st.form('review'):
-                rating=st.radio('해 보니 어땠나요?',RATINGS,index=None)
-                note=st.text_area('나에게 남기는 한 줄 · 선택',max_chars=300,placeholder='예: 음악보다 조용히 앉아 있는 게 좋았어.')
-                done=st.form_submit_button('경험 기록하기',use_container_width=True)
-                if done:
-                    if rating is None: st.warning('어땠는지 하나 골라 주세요.')
-                    elif len(ss.records)>=3000: st.warning('기록이 가득 찼어요. 백업 후 정리해 주세요.')
-                    else:
-                        ss.records.append({'id':uuid.uuid4().hex,'name':e['name'],'activity':e['activity'],'minutes':e['minutes'],'date':dt.datetime.now(dt.timezone.utc).isoformat(),'rating':rating,'note':note.strip()})
-                        ss.experiment=None;ss.just_saved=True;st.rerun()
-            if st.button('이번 활동은 건너뛰기'):
-                ss.experiment=None;st.rerun()
-        if ss.pop('just_saved',False):st.success('경험을 기록했어요. ‘나의 휴식 취향’에서 발견을 확인해 보세요.')
-    with discover:
-        st.subheader('내가 다시 고르고 싶었던 휴식')
-        names=sorted({r['name'] for r in ss.records})
-        if not names:st.info('아직 기록이 없어요. 짧은 활동 하나를 해 보고 느낌을 남겨 보세요.')
-        else:
-            person=st.selectbox('누구의 기록인가요?',names,key='discover_name')
-            rows=[r for r in ss.records if r['name']==person]
-            st.write(f'총 {len(rows)}번의 경험 · {len({r["activity"] for r in rows})}가지 활동')
-            for activity, counts in summary(rows):
-                total=sum(counts)
-                st.markdown(f'**{activity}** · {total}회 경험')
-                st.write(f'다시 하고 싶다 {counts[0]}회 · 보통 {counts[1]}회 · 나와 안 맞는다 {counts[2]}회')
-                st.progress(counts[0]/total,text=f'다시 하고 싶다고 답한 비율 {counts[0]/total:.0%}')
-                if total<3:st.caption('아직 기록이 적어요. 현재의 느낌일 뿐, 확정된 취향은 아니에요.')
-            st.caption('반복 의향 비율 → 경험 수 순으로 정렬합니다. 조건과 날마다 느낌이 달라질 수 있어요. 건강 효과나 가족 간 우열을 평가하지 않습니다.')
-    with history:
-        st.subheader('쌓여 가는 나의 발견')
-        names=sorted({r['name'] for r in ss.records})
-        chosen=st.selectbox('기록 보기',['전체']+names,key='history_filter')
-        rows=[r for r in ss.records if chosen=='전체' or r['name']==chosen]
-        if rows:
-            text='\n\n'.join(f'{r["date"]} | {r["name"]}\n{r["activity"]} · 계획 {r["minutes"]}분\n{r["rating"]}\n{r["note"]}' for r in reversed(rows))
-            st.download_button('보이는 노트 TXT 저장',text,'휴식노트.txt','text/plain')
-        else:st.info('아직 기록이 없어요.')
-        for r in reversed(rows):
-            label=f'{r["name"]} · {r["activity"]} · {r["rating"]}'
-            with st.expander(label):
-                st.caption(f'{r["date"][:10]} (UTC 기준) · 계획 시간 {r["minutes"]}분')
-                st.write(r['note'] or '한 줄 없이 남긴 경험이에요.')
-                agree=st.checkbox('이 기록을 삭제할게요',key='agree_'+r['id'])
-                if st.button('기록 삭제',disabled=not agree,key='del_'+r['id']):
-                    ss.records=[v for v in ss.records if v['id']!=r['id']];st.rerun()
-    st.divider()
-    st.caption('이 앱은 개인의 휴식 선호를 돌아보는 도구이며 진단·치료·의학적 효과를 제공하지 않습니다. 활동이 불편하면 중단하고 다른 방식을 선택하세요.')
+                try:
+                    auth=db.auth.sign_in_with_password({'email':email.strip(),'password':password})
+                    if not auth.user:raise ValueError()
+                    ss.logged_in=True;ss.nick=nick.strip();st.rerun()
+                except Exception:st.error('로그인하지 못했어요. 계정, 비밀번호, 이메일 확인 상태와 연결 설정을 확인해 주세요.')
+        setup();return
+    top=st.columns([3,1,1])
+    top[0].caption(f'👋 {ss.nick} · 우리 가족 부탁함')
+    if top[1].button('새로고침',use_container_width=True):st.rerun()
+    if top[2].button('나가기',use_container_width=True):
+        try:db.auth.sign_out()
+        except Exception:pass
+        for k in ('db','logged_in','nick'):ss.pop(k,None)
+        st.rerun()
+    if ss.get('notice'):st.success(ss.pop('notice'))
+    try:items=db.table('family_errands').select('*').order('created_at',desc=True).limit(1000).execute().data
+    except Exception:
+        st.error('부탁을 불러오지 못했어요. 연결·로그인 만료·데이터베이스 설치를 확인해 주세요. 저장된 데이터를 지우지는 않았어요.');setup();return
+    if len(items)==1000:st.warning('최근 1,000건만 표시해요. 오래된 완료 항목을 정리해 주세요.')
+    a,b,c=st.columns(3)
+    for col,label,status in [(a,'아직 주인 없는 부탁','대기'),(b,'챙기는 중','진행'),(c,'완료했어요','완료')]:col.metric(label,sum(v['status']==status for v in items))
+    board,add=st.tabs(['📋 부탁 보기','＋ 부탁 남기기'])
+    with add:
+        st.subheader('가는 길에 이것도 부탁해요')
+        with st.form('add',clear_on_submit=True):
+            title=st.text_input('무엇을 챙길까요?',max_chars=80,placeholder='예: 우유 1개, 기숙사에 가져갈 충전기')
+            route=st.selectbox('어느 길에?',ROUTES)
+            use_due=st.checkbox('필요한 날짜가 있어요')
+            due=st.date_input('필요한 날짜',value=dt.date.today())
+            note=st.text_area('수량·종류·참고할 점',max_chars=500,placeholder='예: 1L짜리 한 개. 없으면 사지 않아도 돼요.')
+            send=st.form_submit_button('부탁 남기기',type='primary',use_container_width=True)
+        if send:
+            duplicates=[v for v in items if v['status']!='완료' and v['title'].strip().casefold()==title.strip().casefold() and v['route']==route]
+            if not title.strip():st.warning('무엇이 필요한지 적어 주세요.')
+            elif duplicates:st.warning('같은 이동 경로에 제목이 같은 부탁이 이미 있어요. 목록을 먼저 확인해 주세요. 필요하면 수량을 구분해 작성하세요.')
+            else:
+                try:
+                    db.table('family_errands').insert({'title':title.strip(),'route':route,'requester':ss.nick,'note':note.strip(),'due':str(due) if use_due else None}).execute()
+                    ss.notice='부탁을 남겼어요!';st.rerun()
+                except Exception:st.error('저장하지 못했어요. 잠시 후 목록을 새로고침해 중복 저장 여부를 확인해 주세요.')
+    with board:
+        route_filter=st.selectbox('이동 경로',['전체']+ROUTES)
+        status_filter=st.radio('어떤 부탁을 볼까요?',['진행할 부탁','내가 맡은 부탁','완료한 부탁'],horizontal=True)
+        q=st.text_input('부탁 검색',placeholder='제목이나 메모 검색',max_chars=80).strip().casefold()
+        filtered=[v for v in items if (route_filter=='전체' or v['route']==route_filter) and (v['status']=='완료' if status_filter=='완료한 부탁' else v['status']=='진행' and v['assignee']==ss.nick if status_filter=='내가 맡은 부탁' else v['status']!='완료') and (not q or q in (v['title']+' '+v['note']).casefold())]
+        if not filtered:st.info('여기는 아직 비어 있어요. 새 부탁을 남기거나 다른 경로를 확인해 보세요.')
+        for v in filtered:
+            due_text=f' · {v["due"]}까지' if v['due'] else ''
+            st.markdown(f'<div class="tile"><div class="meta">{esc(v["route"])} · {esc(v["status"])}{esc(due_text)}</div><h3>{esc(v["title"])}</h3><div class="meta">부탁한 사람: {esc(v["requester"])}'+(f' · 담당: {esc(v["assignee"])}' if v['assignee'] else '')+'</div></div>',unsafe_allow_html=True)
+            if v['note']:st.write(v['note'])
+            if v['due'] and v['status']!='완료' and v['due']<str(dt.date.today()):st.warning('요청 날짜가 지났어요. 아직 필요한지 확인해 주세요.')
+            if v['status']=='대기':
+                if st.button('🙋 내가 챙길게',key='claim'+v['id'],type='primary',use_container_width=True):
+                    token=str(uuid.uuid4())
+                    try:
+                        db.table('family_errands').update({'status':'진행','assignee':ss.nick,'claim_token':token,'updated_at':dt.datetime.now(dt.timezone.utc).isoformat()}).eq('id',v['id']).eq('status','대기').execute()
+                        check=db.table('family_errands').select('claim_token').eq('id',v['id']).execute().data
+                        ss.notice='내가 맡았어요. 다른 가족에게도 담당자가 표시돼요.' if check and check[0]['claim_token']==token else '다른 가족이 먼저 맡았거나 목록이 변경됐어요.'
+                        st.rerun()
+                    except Exception:st.error('처리 결과를 확인하지 못했어요. 새로고침해 주세요.')
+            elif v['status']=='진행' and v['assignee']==ss.nick:
+                left,right=st.columns(2)
+                for col,label,new_status in [(left,'✓ 챙겼어요','완료'),(right,'다시 부탁하기','대기')]:
+                    if col.button(label,key=new_status+v['id'],use_container_width=True):
+                        try:
+                            change={'status':new_status,'updated_at':dt.datetime.now(dt.timezone.utc).isoformat()}
+                            if new_status=='대기':change.update(assignee='',claim_token=None)
+                            db.table('family_errands').update(change).eq('id',v['id']).eq('status','진행').eq('claim_token',v['claim_token']).execute()
+                            ss.notice='목록을 업데이트했어요. 최신 상태를 확인해 주세요.';st.rerun()
+                        except Exception:st.error('처리하지 못했어요. 새로고침해 주세요.')
+            with st.expander('부탁 삭제'):
+                consent=st.checkbox('가족과 확인했으며 삭제할게요',key='ok'+v['id'])
+                if st.button('삭제',key='del'+v['id'],disabled=not consent):
+                    try:
+                        db.table('family_errands').delete().eq('id',v['id']).execute();st.rerun()
+                    except Exception:st.error('삭제하지 못했어요.')
+    st.caption('🔄 다른 가족의 변경 내용은 ‘새로고침’으로 확인하세요. 자동 푸시 알림은 없어요. 별명은 서로 다르게 사용해 주세요.')
+    with st.expander('우리 가족 사용 약속'):
+        st.write('① 필요한 부탁을 남겨요. ② 가는 사람이 먼저 맡아요. ③ 구입·전달이 끝나면 완료해요. 못 하게 되면 다시 부탁하기를 눌러요. 수량이나 경로가 다르면 서로 확인해 주세요.')
+        st.caption('이 앱은 이동 경로 최적화나 자동 일정 배정이 아닌, 부탁의 중복·누락을 줄이는 가족 공유 목록입니다.')
 
-if __name__=='__main__':
-    main()
+if __name__=='__main__':main()
